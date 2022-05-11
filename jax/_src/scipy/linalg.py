@@ -19,10 +19,11 @@ import numpy as np
 import scipy.linalg
 import textwrap
 
+import jax
 from jax import jit, vmap, jvp
 from jax import lax
 from jax._src.lax import linalg as lax_linalg
-from jax._src.lax import polar as lax_polar
+from jax._src.lax import qdwh
 from jax._src.numpy.util import _wraps, _promote_dtypes_inexact
 from jax._src.numpy import lax_numpy as jnp
 from jax._src.numpy import linalg as np_linalg
@@ -619,11 +620,81 @@ def eigh_tridiagonal(d, e, *, eigvals_only=False, select='a',
   _, _, mid, _ = lax.while_loop(cond, body, (0, lower, mid, upper))
   return mid
 
-@_wraps(scipy.linalg.polar)
-def polar(a, side='right', method='qdwh', eps=None, maxiter=50):
-   unitary, posdef, _ = lax_polar.polar(a, side=side, method=method, eps=eps,
-                                        maxiter=maxiter)
-   return unitary, posdef
+@partial(jit, static_argnames=('side', 'method'))
+@jax.default_matmul_precision("float32")
+def polar(a, side='right', *, method='qdwh', eps=None, max_iterations=None):
+  """Computes the polar decomposition.
+
+  Given the (m x n) matrix `a`, returns the factors of the polar decomposition
+  `u` (m x n) and `p` such that `a = up` (if side is "right"; p is (n x n)) or
+  `a = pu` (if side is "left"; p is (m x m)), where `p` is positive
+  semidefinite.  If `a` is nonsingular, `p` is positive definite and the
+  decomposition is unique. `u` has orthonormal columns unless n > m, in which
+  case it has orthonormal rows.
+
+  Writing an SVD of `a` as `a = u_svd @ s_svd @ v^h_svd`, we have
+  `u = u_svd @ v^h_svd`. Thus the unitary factor `u` can be construed as
+  the application of the signum function to the singular values of `a`;
+  or, if `a` is Hermitian, the eigenvalues.
+
+  Several methods exist to compute the polar decomposition. Currently two
+  are supported:
+    `method`="svd": Computes the SVD of `a` and then forms
+                    `u = u_svd @ v^h_svd`. This fails on the TPU, since
+                    no SVD algorithm independent of the polar decomposition
+                    exists there.
+    `method`="qdwh": Applies a certain iterative expansion of the matrix
+                     sign function to `a` based on QR and Cholesky
+                     decompositions.
+
+  Args:
+    a: The m x n input matrix.
+    side: Determines whether a right or left polar decomposition is computed.
+      If side is "right" then `a = up`. If side is "left" then `a = pu`. The
+      default is "right".
+    method: Determines the algorithm used, as described above.
+    precision: :class:`~jax.lax.Precision` object specifying the matmul precision.
+
+    The remaining arguments are only meaningful if method is "qdwh".
+    eps: The final result will satisfy |X_k - X_k-1| < |X_k| * (4*eps)**(1/3) .
+    max_iterations: Iterations will terminate after this many steps even if the
+      above is unsatisfied.
+  Returns:
+    unitary: The unitary factor (m x n).
+    posdef: The positive-semidefinite factor. Either (n, n) or (m, m)
+      depending on whether side is "right" or "left", respectively.
+  """
+  unitary, _ = _polar_unitary(a, method, eps, max_iterations)
+  if side == "right":
+    posdef = unitary.conj().T @ a
+  elif side == "left":
+    posdef = a @ unitary.conj().T
+  else:
+    raise ValueError(f"Unknown polar decomposition side {side}")
+  posdef = 0.5 * (posdef + posdef.conj().T)
+  return unitary, posdef
+
+
+def polar_unitary(a, *, method="qdwh", eps=None, max_iterations=None):
+  """ Computes the unitary factor u in the polar decomposition `a = u p`
+  (or `a = p u`).
+  """
+  return _polar_unitary(a, method, eps, max_iterations)
+
+
+def _polar_unitary(a, method, eps, max_iterations):
+  if method == "svd":
+    u_svd, _, vh_svd = lax_linalg.svd(a, full_matrices=False)
+    unitary = u_svd @ vh_svd
+    info = None
+  elif method == "qdwh":
+    unitary, j_qr, j_chol, errs = qdwh.qdwh(a, is_symmetric=False, eps=eps,
+                                            max_iterations=max_iterations)
+    info = (j_qr, j_chol, errs)
+  else:
+    raise ValueError(f"Unknown polar decomposition method {method}.")
+  return unitary, info
+
 
 @jit
 def _sqrtm_triu(T):

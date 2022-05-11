@@ -65,14 +65,14 @@ def _use_cholesky(u, params):
   return u
 
 
-@functools.partial(jax.jit, static_argnums=(1, 2, 3))
-def _qdwh(x, is_symmetric, max_iterations):
+def _qdwh(x, is_symmetric, max_iterations, eps):
   """QR-based dynamically weighted Halley iteration for polar decomposition."""
 
   # Estimates `alpha` and `beta = alpha * l`, where `alpha` is an estimate of
   # norm(x, 2) such that `alpha >= norm(x, 2)` and `beta` is a lower bound for
   # the smallest singular value of x.
-  eps = jnp.finfo(x.dtype).eps
+  if eps is None:
+    eps = jnp.finfo(x.dtype).eps
   alpha = (jnp.sqrt(jnp.linalg.norm(x, ord=1)) *
            jnp.sqrt(jnp.linalg.norm(x, ord=jnp.inf)))
   l = eps
@@ -145,13 +145,16 @@ def _qdwh(x, is_symmetric, max_iterations):
 
 
 # TODO: Add pivoting.
-def qdwh(x, is_symmetric, max_iterations=10):
+@functools.partial(jax.jit, static_argnames=('is_symmetric',))
+def qdwh(x, is_symmetric=False, max_iterations=None, eps=None):
   """QR-based dynamically weighted Halley iteration for polar decomposition.
 
   Args:
-    x: A full-rank matrix of shape `m x n` with `m  >= n`.
+    x: A full-rank matrix of shape `m x n`.
     is_symmetric: True if `x` is symmetric.
-    max_iterations: The predefined maximum number of iterations.
+    eps: The final result will satisfy |X_k - X_k-1| < |X_k| * (4*eps)**(1/3) .
+    max_iterations: Iterations will terminate after this many steps even if the
+      above is unsatisfied.
 
   Returns:
     A four-tuple of (u, h, num_iters, is_converged) containing the
@@ -159,29 +162,22 @@ def qdwh(x, is_symmetric, max_iterations=10):
     and `is_converged`, whose value is `True` when the convergence is achieved
     within the maximum number of iterations.
   """
-  m, n = x.shape
-
-  if m < n:
-    raise ValueError('The input matrix of shape m x n must have m >= n.')
-
-  max_iterations = core.concrete_or_error(
-      int, max_iterations, 'The `max_iterations` argument must be statically '
-      'specified to use `qdwh` within JAX transformations.')
-
   is_symmetric = core.concrete_or_error(
       bool, is_symmetric, 'The `is_symmetric` argument must be statically '
       'specified to use `qdwh` within JAX transformations.')
 
-  if is_symmetric:
-    eps = jnp.finfo(x.dtype).eps
-    tol = 50.0 * eps
-    relative_diff = jnp.linalg.norm(x - x.T.conj()) / jnp.linalg.norm(x)
-    if relative_diff > tol:
-      raise ValueError('The input `x` is NOT symmetric because '
-                       '`norm(x-x.H) / norm(x)` is {}, which is greater than '
-                       'the tolerance {}.'.format(relative_diff, tol))
+  if max_iterations is None:
+    max_iterations = 10
+
+  m, n = x.shape
+  wide = m < n
+  if wide:
+    x = x.T.conj()
 
   with jax.default_matmul_precision('float32'):
-    u, h, num_iters, is_converged = _qdwh(x, is_symmetric, max_iterations)
+    u, h, num_iters, is_converged = _qdwh(x, is_symmetric, max_iterations, eps)
+
+  if wide:
+    u = u.T.conj()
 
   return u, h, num_iters, is_converged
